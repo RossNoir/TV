@@ -31,7 +31,7 @@ A Python-based TV simulator that uses VLC to play local media files in a continu
 * **Backtick (`):** Open the TV Guide.
 * **F11:** Toggle fullscreen mode.
 
-* # Using Media Analysis Tool for TV Simulator
+# Using Media Analysis Tool for TV Simulator
 
 This document explains how to use the `media_analysis_tool.py` to prepare your local video files for use with the TV Simulator application.
 
