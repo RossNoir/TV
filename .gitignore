@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.venv/
+env/
+venv/
+
+# User-specific configuration and state
+config.json
+watch_state.json
+
+# IDE / Editor specific
+.vscode/
+.idea/
