@@ -1,21 +1,6 @@
-# tv_sim_x6.py
+# tv_sim_x7.py
 # Designed for Raspberry Pi 4 — prioritizes reliability over quick channel switching
-# d23g - BUG Still freezes on channel change
-# UPDATE: Implement dynamic scaling for TV Guide based on screen size, integrated into TVSimApp.
-# FIX: Ensure TV Guide displays correctly by detaching VLC video output on channel switch.
-# NEW: watch_state.json saves in the same directory as the script.
-# NEW: watch_state.json saves every minute for improved crash recovery.
-# --- VERSION WITH DIRECT CHANNEL INPUT V2 ---
-# UPDATE: Channel number display now remains on screen for 2.5s after a channel change.
-# NEW: Added direct channel number input via keyboard (e.g., "01", "12").
-# NEW: On-screen display for typed channel numbers.
-# UPDATE: TV Guide is now assigned to the ` (backtick) key.
-# REMOVED: The previous UI toggle function on the ` key has been removed.
-# UPDATE: Now reads "channel_order" from config.json to set the channel lineup.
-# UPDATE: Scans for numbered playlist files (e.g., "01_ChannelName_playlist.json").
-# FIX: TV Guide now correctly displays channels in the specified order.
-# FIX: Decoupled UI updates from player operations to prevent freezing on arrow key channel changes.
-# FIX: Corrected undefined variable "text_y" in the TV Guide drawing function.
+
 
 import threading
 import tkinter as tk
@@ -151,7 +136,8 @@ class ChannelPlayer:
     def stop(self):
         if self.player and self.player.is_playing():
             self.player.stop()
-            time.sleep(0.5)
+            # ### FIX ### Increased sleep duration for more stability in fullscreen
+            time.sleep(0.7)
 
     def play_current(self):
         item, offset = self.get_current_item()
@@ -220,13 +206,17 @@ class TVSimApp:
         self.active_channel = None
         self.watch_state = {}
 
-        # --- Logic for Direct Channel Input ---
+        # --- Logic for Direct Channel Input & Cooldown ---
         self.channel_input_buffer = ""
         self.channel_input_job = None
         self.input_font = font.Font(family="Helvetica", size=100, weight="bold")
         self.channel_input_label = tk.Label(
             self.canvas, text="", font=self.input_font, fg="white", bg="black",
         )
+        self.is_changing_channel = False
+
+        # ### NEW ### Variable to manage the cursor auto-hide timer.
+        self.cursor_hide_job = None
 
         self.load_watch_state()
 
@@ -252,19 +242,37 @@ class TVSimApp:
         # --- Keyboard Bindings ---
         self.root.bind("<Up>", self.channel_up)
         self.root.bind("<Down>", self.channel_down)
-        self.root.bind("<F11>", self.toggle_fullscreen)
-        # Bind number keys 0-9 to the new handler
+        self.root.bind("<space>", self.toggle_fullscreen)
         for i in range(10):
             self.root.bind(str(i), self.handle_digit_press)
-        # Bind backtick to go to the TV Guide
         self.root.bind("`", self.go_to_tv_guide)
+        # ### NEW ### Bind mouse movement to its handler function.
+        self.root.bind("<Motion>", self.handle_mouse_move)
 
         self.monitor_playback()
         self.root.after(60 * 1000, self.periodic_save_watch_state)
+        self.handle_mouse_move() # Start the cursor hide timer initially
 
-    # --- Methods for Direct Channel Input ---
+    # ### NEW ### Hides the cursor when the mouse is idle.
+    def hide_cursor(self):
+        self.root.config(cursor="none")
+
+    # ### NEW ### Shows the cursor and resets the idle timer.
+    def handle_mouse_move(self, event=None):
+        # Make the cursor visible
+        self.root.config(cursor="")
+        # If a hide job is scheduled, cancel it
+        if self.cursor_hide_job:
+            self.root.after_cancel(self.cursor_hide_job)
+        # Schedule a new hide job for 3 seconds in the future
+        self.cursor_hide_job = self.root.after(3000, self.hide_cursor)
+
+
     def handle_digit_press(self, event):
         """Handles a number key press for channel input."""
+        if self.is_changing_channel:
+            return
+            
         if self.channel_input_job:
             self.root.after_cancel(self.channel_input_job)
 
@@ -277,13 +285,11 @@ class TVSimApp:
                 if 0 < channel_num <= len(RAW_CHANNELS):
                     self.set_channel_by_index(channel_num - 1)
                 
-                # Schedule input to be cleared after 2.5s
                 self.channel_input_job = self.root.after(2500, self.clear_channel_input)
 
             except ValueError:
                 self.clear_channel_input()
         else:
-            # Set a timeout for the first digit
             self.channel_input_job = self.root.after(2500, self.clear_channel_input)
 
     def update_channel_input_display(self):
@@ -300,7 +306,7 @@ class TVSimApp:
         self.channel_input_label.place_forget()
 
     def go_to_tv_guide(self, event=None):
-        """Switches directly to the TV Guide channel."""
+        if self.is_changing_channel: return
         try:
             guide_index = CHANNELS.index("TV Guide")
             self.set_channel_by_index(guide_index)
@@ -341,7 +347,6 @@ class TVSimApp:
             self.draw_tv_guide()
 
     def load_all_playlists_for_guide(self):
-        """Loads all channel playlists for the TV Guide display."""
         self.channels_guide_data = {}
         for channel_name in RAW_CHANNELS:
             playlist_file = playlist_map.get(channel_name)
@@ -367,21 +372,21 @@ class TVSimApp:
 
     def set_channel_by_index(self, index):
         """Switches to the channel at the given index."""
-        if not CHANNELS:
-            return
+        if not CHANNELS: return
+        
+        self.is_changing_channel = True
         
         index %= len(CHANNELS)
         name = CHANNELS[index]
 
         if self.active_channel and self.active_channel in self.channel_players:
             player = self.channel_players[self.active_channel]
-            player.stop()
+            player.stop() 
             if player.player:
                 if sys.platform.startswith('win'):
                     player.player.set_hwnd(0)
                 else:
                     player.player.set_xwindow(0)
-            time.sleep(0.5)
         
         self.active_channel_index = index
         self.active_channel = name
@@ -401,102 +406,79 @@ class TVSimApp:
             player.set_video_output(self.video_window_id) 
             player.current_item_name = None
             player.play_current()
+        
+        self.root.after(1000, self.enable_channel_changing)
+
+    def enable_channel_changing(self):
+        """Allows channel changing again after the cooldown period."""
+        self.is_changing_channel = False
 
     def draw_tv_guide(self):
         self.canvas.delete("all")
-        
         canvas_width = self.canvas.winfo_width()
         canvas_height = self.canvas.winfo_height()
-
         if canvas_width <= 1 or canvas_height <= 1: return
-
         num_channels = len(RAW_CHANNELS)
         if num_channels == 0:
             self.canvas.create_text(canvas_width / 2, canvas_height / 2, text="No channels configured.", fill="white", font=("Helvetica", 16))
             return
-
         time_header_height = int(canvas_height * 0.08)
         channel_name_width = int(canvas_width * 0.18)
         row_height = (canvas_height - time_header_height) / num_channels
-        
         guide_padding = 10
         left_margin = channel_name_width + guide_padding
         top_margin = time_header_height
-        
         time_window_minutes = 120
         display_area_width = canvas_width - left_margin - guide_padding
         if display_area_width <= 0: return
-
         px_per_sec = display_area_width / (time_window_minutes * 60)
-
         channel_font_size = max(8, min(int(row_height * 0.3), 18))
         program_font_size = max(6, min(int(row_height * 0.2), 14))
         time_font_size = max(8, min(int(time_header_height * 0.35), 22))
-
         font_channel = ("Helvetica", channel_font_size, "bold")
         font_regular = ("Helvetica", program_font_size)
         font_time_header = ("Helvetica", time_font_size, "bold")
-
         now_dt = datetime.now()
         current_unix_time = time.time()
-        
         guide_display_start_dt = now_dt.replace(minute=(now_dt.minute // 30) * 30, second=0, microsecond=0)
         guide_display_start_unix = guide_display_start_dt.timestamp()
-
         time_interval_sec = 30 * 60
-        
         for i in range(int(time_window_minutes / 30) + 2):
             marker_unix_time = guide_display_start_unix + (i * time_interval_sec)
             x_pos = left_margin + (marker_unix_time - guide_display_start_unix) * px_per_sec
-            
             if x_pos < canvas_width:
                 self.canvas.create_line(x_pos, time_header_height, x_pos, canvas_height, fill="#3a3a3a", width=1)
                 label_dt = datetime.fromtimestamp(marker_unix_time)
                 label_text = label_dt.strftime("%I:%M %p").lstrip("0").replace(" 0", " ")
                 self.canvas.create_text(x_pos, time_header_height / 2, text=label_text, anchor="center", fill="white", font=font_time_header)
-
         current_x_pos = left_margin + (current_unix_time - guide_display_start_unix) * px_per_sec
         self.canvas.create_line(current_x_pos, 0, current_x_pos, canvas_height, fill="red", width=2)
-        
         for i, ch_name in enumerate(RAW_CHANNELS):
             y_start_row = top_margin + i * row_height
             y_end_row = y_start_row + row_height
-
             display_name = f"{i+1:02d} {CUSTOM_NAMES.get(ch_name, ch_name)}"
             self.canvas.create_text(channel_name_width / 2, y_start_row + row_height / 2, text=display_name, anchor="center", fill="white", font=font_channel, width=channel_name_width - 10)
-            
             self.canvas.create_line(0, y_end_row, canvas_width, y_end_row, fill="#2a2a2a", width=1)
-
             playlist = self.channels_guide_data.get(ch_name, [])
             if not playlist: continue
-
             total_playlist_duration = playlist[-1]["start"] + playlist[-1]["duration"] if playlist else 0
             if total_playlist_duration == 0: continue
-
             player = self.channel_players.get(ch_name)
             channel_elapsed_from_start = (current_unix_time - player.channel_start_time) if player else current_unix_time 
-
             effective_playlist_cycle_start_unix = current_unix_time - (channel_elapsed_from_start % total_playlist_duration)
             guide_display_end_unix = guide_display_start_unix + (time_window_minutes * 60)
-
             for item in playlist:
                 item_abs_start_unix = effective_playlist_cycle_start_unix + item["start"]
                 item_abs_end_unix = item_abs_start_unix + item["duration"]
-
                 overlap_start_unix = max(item_abs_start_unix, guide_display_start_unix)
                 overlap_end_unix = min(item_abs_end_unix, guide_display_end_unix)
-
                 if overlap_start_unix < overlap_end_unix:
                     x_start_draw = left_margin + (overlap_start_unix - guide_display_start_unix) * px_per_sec
                     x_end_draw = left_margin + (overlap_end_unix - guide_display_start_unix) * px_per_sec
                     width = max(x_end_draw - x_start_draw, 4)
-                    
                     self.canvas.create_rectangle(x_start_draw, y_start_row + 2, x_start_draw + width, y_end_row - 2, fill="#337ab7", outline="black")
-                    
                     text = os.path.splitext(item["name"])[0][:40]
-                    if width > 30: # Only draw text if there's enough space
-                        # ### FIX ###
-                        # The undefined variable "text_y" has been replaced with the correct calculation.
+                    if width > 30:
                         self.canvas.create_text(x_start_draw + 5, y_start_row + 5, text=text, anchor="nw", fill="white", font=font_regular)
             
     def monitor_playback(self):
@@ -513,14 +495,32 @@ class TVSimApp:
         self.root.after(1000, self._monitor_playback_loop)
 
     def channel_up(self, event=None):
-        """Switches to the previous channel."""
+        """Switches to the previous channel and displays its number."""
+        if self.is_changing_channel: return
         self.clear_channel_input()
-        self.set_channel_by_index(self.active_channel_index - 1)
+        
+        new_index = (self.active_channel_index - 1) % len(CHANNELS)
+        if CHANNELS[new_index] != "TV Guide":
+            channel_num_to_display = new_index + 1
+            self.channel_input_buffer = f"{channel_num_to_display:02d}"
+            self.update_channel_input_display()
+            self.channel_input_job = self.root.after(2500, self.clear_channel_input)
+
+        self.set_channel_by_index(new_index)
 
     def channel_down(self, event=None):
-        """Switches to the next channel."""
+        """Switches to the next channel and displays its number."""
+        if self.is_changing_channel: return
         self.clear_channel_input()
-        self.set_channel_by_index(self.active_channel_index + 1)
+
+        new_index = (self.active_channel_index + 1) % len(CHANNELS)
+        if CHANNELS[new_index] != "TV Guide":
+            channel_num_to_display = new_index + 1
+            self.channel_input_buffer = f"{channel_num_to_display:02d}"
+            self.update_channel_input_display()
+            self.channel_input_job = self.root.after(2500, self.clear_channel_input)
+            
+        self.set_channel_by_index(new_index)
 
 if __name__ == '__main__':
     root = tk.Tk()
