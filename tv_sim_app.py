@@ -1,28 +1,8 @@
-# tv_sim_x11.py
-# FINAL UPDATE: Implemented a single master clock for timeline synchronization.
-# NEW: Added "last channel recall" feature, accessible with the Tab key.
-# NEW: Removed the startup prompt to resume. The app now resumes automatically if a watch_state.json file is found.
-#
+# tv_sim_x13.py
 # Designed for Raspberry Pi 4 — prioritizes reliability over quick channel switching
-# UPDATE: Implement dynamic scaling for TV Guide based on screen size, integrated into TVSimApp.
-# FIX: Ensure TV Guide displays correctly by detaching VLC video output on channel switch.
-# NEW: watch_state.json saves in the same directory as the script.
-# NEW: watch_state.json saves every minute for improved crash recovery.
-# --- VERSION WITH DIRECT CHANNEL INPUT V2 ---
-# UPDATE: Channel number display now remains on screen for 2.5s after a channel change.
-# NEW: Added direct channel number input via keyboard (e.g., "01", "12").
-# NEW: On-screen display for typed channel numbers.
-# UPDATE: TV Guide is now assigned to the ` (backtick) key.
-# REMOVED: The previous UI toggle function on the ` key has been removed.
-# UPDATE: Now reads "channel_order" from config.json to set the channel lineup.
-# UPDATE: Scans for numbered playlist files (e.g., "01_ChannelName_playlist.json").
-# FIX: TV Guide now correctly displays channels in the specified order.
-# FIX: Decoupled UI updates from player operations to prevent freezing on arrow key channel changes.
-# FIX: Corrected undefined variable "text_y" in the TV Guide drawing function.
-# FIX: Added a "cooldown" to channel changes to prevent freezes in fullscreen mode.
-# NEW: Channel number is now displayed when using up/down arrow keys.
-# NEW: Added logic to automatically hide the mouse cursor after 3 seconds of inactivity.
-# FIX: Replaced unreliable "monitor_playback" polling loop with a stable, event-driven system for advancing media on the same channel.
+# MODIFIED: Removed the startup prompt to resume. The app now resumes automatically.
+# NEW: Added "last channel recall" feature, accessible with the Tab key.
+# FIX: Prevents time drift "jump" by ignoring re-selection of the currently active channel.
 
 import threading
 import tkinter as tk
@@ -53,40 +33,52 @@ except json.JSONDecodeError:
 
 PLAYLISTS_PATH = Path(config.get("playlists_path", "playlists")).resolve()
 CUSTOM_NAMES = config.get("custom_names", {})
+# Get the desired channel order from the config file.
 ORDERED_CHANNELS_FROM_CONFIG = config.get("channel_order", [])
 
+# Scan the playlists directory for numbered playlist files.
 playlist_files = list(PLAYLISTS_PATH.glob("*_playlist.json"))
 playlist_map = {}
 for f in playlist_files:
+    # Use regex to find files named like "01_ShowName_playlist.json"
     match = re.match(r"(\d+_)(.+?)(_playlist\.json)", f.name)
     if match:
-        channel_name = match.group(2)
-        playlist_map[channel_name] = f
+        channel_name = match.group(2) # The part between the number and "_playlist.json"
+        playlist_map[channel_name] = f # Map the name to the full Path object
 
+# Filter and sort the channels based on the order in config AND the existence of a playlist file.
 RAW_CHANNELS = [ch for ch in ORDERED_CHANNELS_FROM_CONFIG if ch in playlist_map]
 
 if not RAW_CHANNELS:
-    messagebox.showwarning("No Playlists Found", "Could not find any valid, numbered playlists in the specified directory.")
+    messagebox.showwarning("No Playlists Found", "Could not find any valid, numbered playlists in the specified directory.\nPlease run the Media Analysis Tool to generate them.")
 
+# The final list of channels for the UI, including the TV Guide.
 CHANNELS = RAW_CHANNELS + ["TV Guide"]
 # --- END Channel Loading Logic ---
 
 
 class ChannelPlayer:
-    def __init__(self, channel_name, playlist_path, video_window_id, app_instance):
+    def __init__(self, channel_name, playlist_path, video_window_id):
         self.channel_name = channel_name
-        self.playlist_path = playlist_path
+        self.playlist_path = playlist_path # Store the full path
         self.video_window_id = video_window_id
-        self.app = app_instance
         
         self.vlc_instance = vlc.Instance(
-            '--vout=xvideo', '--file-caching=10000', '--network-caching=5000',
-            '--live-caching=5000', '--avcodec-threads=4', '--sout-mux-caching=5000',
-            '--drop-late-frames', '--no-skip-frames', '--ignore-config',
-            '--no-metadata-network-access', '--verbose=3'
+            '--vout=kms',
+            '--file-caching=10000',
+            '--network-caching=5000',
+            '--live-caching=5000',
+            '--avcodec-threads=4',
+            '--sout-mux-caching=5000',
+            '--drop-late-frames',
+            '--no-skip-frames',
+            '--ignore-config',
+            '--no-metadata-network-access',
+            '--verbose=2'
         )
         
         self.player = None
+        self.channel_start_time = time.time()
         self.playlist = self.load_playlist()
         self.current_item_name = None
         
@@ -103,6 +95,7 @@ class ChannelPlayer:
 
         self.event_manager = self.player.event_manager()
         self.event_manager.event_attach(vlc.EventType.MediaPlayerEncounteredError, self.on_vlc_error)
+        self.event_manager.event_attach(vlc.EventType.MediaPlayerMediaChanged, self.on_vlc_media_changed)
         self.event_manager.event_attach(vlc.EventType.MediaPlayerEndReached, self.on_vlc_end_reached)
         print(f"VLC player created for channel: {self.channel_name}")
 
@@ -113,21 +106,33 @@ class ChannelPlayer:
             self.player.set_xwindow(window_id)
 
     def load_playlist(self):
+        """Loads the channel's playlist from the provided path."""
         try:
             with open(self.playlist_path) as f:
                 return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            messagebox.showerror("Playlist Error", f"Error loading playlist for {self.channel_name}: {e}")
+        except FileNotFoundError:
+            messagebox.showerror("Playlist Error", f"Playlist file not found for {self.channel_name}: {self.playlist_path}\nThis should not happen if channels loaded correctly.")
+            return []
+        except json.JSONDecodeError:
+            messagebox.showerror("Playlist Error", f"Error decoding playlist for {self.channel_name}: {self.playlist_path}")
             return []
 
     def get_current_item(self):
-        if not self.playlist: return None, None
+        if not self.playlist:
+            return None, None
+
         total_duration = sum(item["duration"] for item in self.playlist)
-        if total_duration == 0: return None, None
-        elapsed = (time.time() - self.app.simulation_start_time) % total_duration
+        if total_duration == 0:
+            return None, None
+
+        elapsed = (time.time() - self.channel_start_time) % total_duration
+        
         for item in self.playlist:
-            if item["start"] <= elapsed < (item["start"] + item["duration"]):
-                return item, elapsed - item["start"]
+            start = item["start"]
+            duration = item["duration"]
+            end = start + duration
+            if start <= elapsed < end:
+                return item, elapsed - start
         return None, None
 
     def stop(self):
@@ -137,37 +142,40 @@ class ChannelPlayer:
 
     def play_current(self):
         item, offset = self.get_current_item()
+
         if not item:
-            if self.player.is_playing(): self.stop()
+            if self.player.is_playing():
+                self.stop()
             print(f"[{self.channel_name}] No current item to play.")
             return
-        if item["name"] != self.current_item_name or not self.player.is_playing():
-            self.play_item(item, offset)
 
-    def play_item(self, item, offset=0):
-        print(f"[{self.channel_name}] Loading media: {item['name']} at {offset:.2f}s")
-        self.current_item_name = item["name"]
-        media = self.vlc_instance.media_new(item["path"])
-        self.player.set_media(media)
-        self.player.play()
-        if offset > 0:
-            self.app.root.after(200, lambda: self.player.set_time(int(offset * 1000)))
+        if item["name"] != self.current_item_name or not self.player.is_playing():
+            print(f"[{self.channel_name}] Loading media: {item['name']} at {offset:.2f}s")
+            self.current_item_name = item["name"]
+
+            media = self.vlc_instance.media_new(item["path"])
+            self.player.set_media(media)
+            self.player.play()
+
+            for _ in range(20):
+                if self.player.is_playing():
+                    break
+                time.sleep(0.1)
+            else:
+                print(f"Warning: Player for {self.channel_name} did not start playing after preload wait.")
+
+            if self.player.is_playing():
+                self.player.set_time(int(offset * 1000))
 
     def on_vlc_error(self, event):
         print(f"VLC Error on channel {self.channel_name}: Event Type {event.type}. Attempting to recover.")
         self.current_item_name = None
-        self.app.root.after(1000, self.play_current)
+
+    def on_vlc_media_changed(self, event):
+        print(f"VLC Media Changed on channel {self.channel_name}")
 
     def on_vlc_end_reached(self, event):
-        print(f"[{self.channel_name}] Media finished. Advancing to next item.")
-        current_index = next((i for i, item in enumerate(self.playlist) if item["name"] == self.current_item_name), -1)
-        if current_index != -1:
-            next_index = (current_index + 1) % len(self.playlist)
-            next_item = self.playlist[next_index]
-            self.app.root.after(10, lambda: self.play_item(next_item, offset=0))
-        else:
-            print(f"[{self.channel_name}] Could not find current item. Re-syncing.")
-            self.app.root.after(10, self.play_current)
+        print(f"VLC End Reached on channel {self.channel_name}")
 
 
 class TVSimApp:
@@ -183,6 +191,7 @@ class TVSimApp:
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.update_idletasks()
         self.video_window_id = self.canvas.winfo_id()
+
         self.canvas.bind("<Configure>", self.on_canvas_configure)
 
         self.button_frame = tk.Frame(root)
@@ -195,9 +204,11 @@ class TVSimApp:
         self.fullscreen_button.pack(side=tk.LEFT, padx=10)
 
         self.active_channel_index = 0
-        self.last_channel_index = 0
         self.active_channel = None
-        self.simulation_start_time = 0
+        self.watch_state = {}
+
+        # --- Logic for Direct Channel Input, Cooldown, and Recall ---
+        self.last_channel_index = 0
         self.channel_input_buffer = ""
         self.channel_input_job = None
         self.input_font = font.Font(family="Helvetica", size=100, weight="bold")
@@ -207,13 +218,18 @@ class TVSimApp:
         self.is_changing_channel = False
         self.cursor_hide_job = None
 
-        self.load_or_initialize_timeline()
+        self.load_watch_state()
 
         self.channel_players = {}
         for name in RAW_CHANNELS:
             playlist_path = playlist_map.get(name)
             if playlist_path:
-                self.channel_players[name] = ChannelPlayer(name, playlist_path, self.video_window_id, self)
+                self.channel_players[name] = ChannelPlayer(name, playlist_path, self.video_window_id)
+
+        if self.watch_state:
+            for name, player in self.channel_players.items():
+                if player and name in self.watch_state:
+                    player.channel_start_time -= self.watch_state[name]
 
         self.channels_guide_data = {}
         self.load_all_playlists_for_guide()
@@ -221,7 +237,7 @@ class TVSimApp:
         if CHANNELS:
             self.set_channel_by_index(self.active_channel_index)
         else:
-            messagebox.showwarning("No Channels", "No valid channels found.")
+            messagebox.showwarning("No Channels", "No valid channels found. Please run the Media Analysis Tool.")
 
         # --- Keyboard Bindings ---
         self.root.bind("<Up>", self.channel_up)
@@ -233,6 +249,7 @@ class TVSimApp:
         self.root.bind("`", self.go_to_tv_guide)
         self.root.bind("<Motion>", self.handle_mouse_move)
 
+        self.monitor_playback()
         self.root.after(60 * 1000, self.periodic_save_watch_state)
         self.handle_mouse_move()
 
@@ -278,43 +295,37 @@ class TVSimApp:
             guide_index = CHANNELS.index("TV Guide")
             self.set_channel_by_index(guide_index)
         except ValueError:
-            print("TV Guide channel not found.")
+            print("TV Guide channel not found in the channel list.")
 
-    # ### MODIFIED ### This function now automatically resumes without prompting the user.
-    def load_or_initialize_timeline(self):
-        """
-        Automatically resumes from the watch state if the file exists.
-        Otherwise, starts a fresh timeline.
-        """
+    def load_watch_state(self):
         if os.path.exists(WATCH_STATE_PATH):
             try:
+                print(f"Found {WATCH_STATE_PATH}, attempting to resume.")
                 with open(WATCH_STATE_PATH, "r") as f:
-                    saved_state = json.load(f)
-                    elapsed_time = saved_state.get("elapsed_time", 0)
-                    # Calculate the historical start time to resume the timeline
-                    self.simulation_start_time = time.time() - elapsed_time
-                    print(f"Session resumed. Effective start time: {self.simulation_start_time}")
-                    return
+                    self.watch_state = json.load(f)
             except (json.JSONDecodeError, Exception) as e:
-                # If file is corrupted or unreadable, start fresh
-                print(f"Warning: Could not load watch state from {WATCH_STATE_PATH}: {e}. Starting fresh.")
-        
-        # If the file doesn't exist or loading failed, start a new session
-        print("Starting a fresh session.")
-        self.simulation_start_time = time.time()
-
+                print(f"Warning: Could not load {WATCH_STATE_PATH}. Starting fresh. Error: {e}")
+                self.watch_state = {}
+        else:
+            print("No watch state file found. Starting a fresh session.")
+            self.watch_state = {}
 
     def periodic_save_watch_state(self):
         self.save_watch_state()
         self.root.after(60 * 1000, self.periodic_save_watch_state)
 
     def save_watch_state(self):
-        state = {"elapsed_time": time.time() - self.simulation_start_time}
+        state = {}
+        now = time.time()
+        for name, player in self.channel_players.items():
+            if player and hasattr(player, 'channel_start_time'):
+                elapsed = now - player.channel_start_time
+                state[name] = elapsed
         try:
             with open(WATCH_STATE_PATH, "w") as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
-            print(f"Error saving watch state: {e}")
+            print(f"Error saving watch state to {WATCH_STATE_PATH}: {e}")
 
     def on_canvas_configure(self, event):
         if self.active_channel == "TV Guide":
@@ -324,13 +335,15 @@ class TVSimApp:
         self.channels_guide_data = {}
         for channel_name in RAW_CHANNELS:
             playlist_file = playlist_map.get(channel_name)
-            if playlist_file:
+            if playlist_file and playlist_file.exists():
                 try:
                     with open(playlist_file, 'r') as f:
                         self.channels_guide_data[channel_name] = json.load(f)
-                except Exception as e:
-                    print(f"Error loading playlist for {channel_name}: {e}")
+                except json.JSONDecodeError:
+                    print(f"Error decoding playlist for TV Guide: {playlist_file}. Skipping.")
                     self.channels_guide_data[channel_name] = []
+            else:
+                self.channels_guide_data[channel_name] = []
 
     def toggle_fullscreen(self, event=None):
         self.fullscreen = not self.fullscreen
@@ -342,13 +355,20 @@ class TVSimApp:
         if self.active_channel == "TV Guide":
             self.draw_tv_guide()
 
+    # ### MODIFIED ### Added the check to prevent re-tuning the same channel.
     def set_channel_by_index(self, index, is_recall=False):
-        if not CHANNELS or self.is_changing_channel: return
+        # ### FIX ### The core logic to prevent the time drift "jump".
+        if index == self.active_channel_index and not is_recall:
+            print(f"Ignoring request to re-tune the current channel ({index + 1}) to prevent drift.")
+            return # Do nothing if the channel is the same.
+
+        if not CHANNELS: return
         
         if not is_recall and CHANNELS[self.active_channel_index] != "TV Guide":
             self.last_channel_index = self.active_channel_index
-
+        
         self.is_changing_channel = True
+        
         index %= len(CHANNELS)
         name = CHANNELS[index]
 
@@ -367,7 +387,12 @@ class TVSimApp:
 
         if name == "TV Guide":
             for player_obj in self.channel_players.values():
-                if player_obj.player: player_obj.stop()
+                if player_obj.player:
+                    player_obj.stop()
+                    if sys.platform.startswith('win'):
+                        player_obj.player.set_hwnd(0)
+                    else:
+                        player_obj.player.set_xwindow(0)
             self.draw_tv_guide()
         else:
             player = self.channel_players[name]
@@ -445,7 +470,8 @@ class TVSimApp:
             if not playlist: continue
             total_playlist_duration = playlist[-1]["start"] + playlist[-1]["duration"] if playlist else 0
             if total_playlist_duration == 0: continue
-            channel_elapsed_from_start = current_unix_time - self.simulation_start_time
+            player = self.channel_players.get(ch_name)
+            channel_elapsed_from_start = (current_unix_time - player.channel_start_time) if player else current_unix_time 
             effective_playlist_cycle_start_unix = current_unix_time - (channel_elapsed_from_start % total_playlist_duration)
             guide_display_end_unix = guide_display_start_unix + (time_window_minutes * 60)
             for item in playlist:
@@ -461,27 +487,46 @@ class TVSimApp:
                     text = os.path.splitext(item["name"])[0][:40]
                     if width > 30:
                         self.canvas.create_text(x_start_draw + 5, y_start_row + 5, text=text, anchor="nw", fill="white", font=font_regular)
+            
+    def monitor_playback(self):
+        if self.active_channel and self.active_channel != "TV Guide":
+            player = self.channel_players[self.active_channel]
+            player.play_current()
+        self.root.after(1000, self._monitor_playback_loop)
+
+    def _monitor_playback_loop(self):
+        if self.active_channel and self.active_channel != "TV Guide":
+            player = self.channel_players.get(self.active_channel)
+            if player:
+                player.play_current()
+        self.root.after(1000, self._monitor_playback_loop)
 
     def channel_up(self, event=None):
+        """Switches to the previous channel and displays its number."""
         if self.is_changing_channel: return
         self.clear_channel_input()
+        
         new_index = (self.active_channel_index - 1) % len(CHANNELS)
         if CHANNELS[new_index] != "TV Guide":
             channel_num_to_display = new_index + 1
             self.channel_input_buffer = f"{channel_num_to_display:02d}"
             self.update_channel_input_display()
             self.channel_input_job = self.root.after(2500, self.clear_channel_input)
+
         self.set_channel_by_index(new_index)
 
     def channel_down(self, event=None):
+        """Switches to the next channel and displays its number."""
         if self.is_changing_channel: return
         self.clear_channel_input()
+
         new_index = (self.active_channel_index + 1) % len(CHANNELS)
         if CHANNELS[new_index] != "TV Guide":
             channel_num_to_display = new_index + 1
             self.channel_input_buffer = f"{channel_num_to_display:02d}"
             self.update_channel_input_display()
             self.channel_input_job = self.root.after(2500, self.clear_channel_input)
+            
         self.set_channel_by_index(new_index)
 
 if __name__ == '__main__':
