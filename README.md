@@ -1,4 +1,4 @@
-# Direct Sound Radio TV Simulator
+# Noir's TV Simulator
 
 ## Project Documentation
 
