@@ -8,6 +8,7 @@
 
 The TV Simulator is a Python application designed to mimic the experience of watching old-school broadcast television. It plays local video files from organized playlists in a continuous, synchronized loop, creating the illusion of distinct channels with their own schedules. The application features a dynamic, real-time TV guide, supports keyboard and HDMI-CEC remote controls, and is optimized for low-power devices like the Raspberry Pi.
 
+This was prototyped on PC and Raspberry Pi 4b with 4gb and 8gb RAM variants and was meant to run on the RP. Video performance is limited to 720p viewing, though could range to 1080p on RP5 platforms. Standard definition content is advisable.
 ---
 
 ## How It Works: The Simulation Flow
