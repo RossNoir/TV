@@ -1,4 +1,4 @@
-# Noir's TV Simulator
+# Rerun TV Simulator
 
 ## Project Documentation
 
